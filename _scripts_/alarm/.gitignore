@@ -1,0 +1,13 @@
+# cache
+__pycache__/
+
+# vim session
+.vim_session
+
+# virtual environments
+venv/
+env/
+
+# logs
+logs/
+*.log
