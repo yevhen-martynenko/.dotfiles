@@ -1,12 +1,15 @@
 import os
 import time
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 class Logger:
-    def __init__(self, file_path: str="logs/main.log"):
+    def __init__(self, file_path: str=None):
         self.start_time = time.time()
-        self.file_path = file_path
+        self.file_path = file_path or os.getenv("LOG_FILE_PATH")
 
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
 
