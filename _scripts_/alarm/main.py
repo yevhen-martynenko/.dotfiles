@@ -1,13 +1,19 @@
-import subprocess
 import os
 import sys
-import curses
-from dotenv import load_dotenv
+import subprocess
 from argparse import ArgumentParser, Namespace
 
+import curses
+from dotenv import load_dotenv
+
+from consts import (
+    TIMEOUT_MS,
+    NOTIFICATION_TIMEOUT,
+    SOUND_TIMEOUT,
+    BIG_DIGITS
+)
 from ext import configure_parser
 from ext import Logger
-from consts import BIG_DIGITS
 
 load_dotenv()
 
@@ -16,6 +22,7 @@ class Alarm:
     def __init__(self, stdscr, args, logger, time_seconds: int, message: str) -> None:
         self.stdscr = stdscr
         self.time = time_seconds
+        self.original_time = time_seconds
         self.message = message
         self.args = args
         self.logger = logger
@@ -26,7 +33,7 @@ class Alarm:
         self.stdscr.keypad(True)
         curses.curs_set(0)
         curses.noecho()
-        self.stdscr.timeout(1000)
+        self.stdscr.timeout(TIMEOUT_MS)
 
         init_colors()
 
@@ -45,16 +52,65 @@ class Alarm:
                 lines[i] += digit[i] + '  '
 
         # center vertically
-        start_y = height // 2 - len(lines) // 2
+        start_y = max(0, height // 2 - len(lines) // 2)
         for i, line in enumerate(lines):
-            x = (width - len(line)) // 2
-            self.stdscr.addstr(start_y + i, x, line, curses.color_pair(1))
+            if start_y + i < height:
+                x = max(0, (width - len(line)) // 2)
+                try:
+                    self.stdscr.addstr(start_y + i, x, line[:width], curses.color_pair(1))
+                except curses.error:
+                    pass
 
         # message
-        msg_y = start_y + len(lines) + 1
-        msg_x = (width - len(self.message)) // 2
+        if self.message:
+            msg_y = start_y + len(lines) + 1
+            if msg_y < height:
+                msg_x = max(0, (width - len(self.message)) // 2)
+                try:
+                    self.stdscr.addstr(msg_y, msg_x, self.message[:width], curses.color_pair(1))
+                except curses.error:
+                    pass
+
+    def send_notification(self, title: str, body: str):
         try:
-            self.stdscr.addstr(msg_y, msg_x, self.message, curses.color_pair(1))
+            subprocess.run(
+                ['notify-send', title, body],
+                stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                check=False,
+                timeout=NOTIFICATION_TIMEOUT,
+            )
+            self.logger.log(f"Notification sent: {title} - {body}")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            self.logger.log(f"Notification failed: {title} - {e}")
+    
+    def play_alarm_sound(self):
+        sound_path = os.getenv("ALARM_SOUND_PATH")
+        try:
+            subprocess.run(
+                ['cvlc', sound_path],
+                stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                check=False,
+                timeout=SOUND_TIMEOUT,
+            )
+            self.logger.log(f"Alarm sound played: {sound_path}")
+            return
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    def display_finished_screen(self):
+        height, width = self.stdscr.getmaxyx()
+        msg = "TIME'S UP!"
+        y = max(0, height // 2)
+        x = max(0, (width - len(msg)) // 2)
+        
+        try:
+            self.stdscr.addstr(y, x, msg[:width], curses.color_pair(1))
+            if self.message and y + 2 < height:
+                msg_y = y + 2
+                msg_x = max(0, (width - len(self.message)) // 2)
+                self.stdscr.addstr(msg_y, msg_x, self.message[:width], curses.color_pair(1))
         except curses.error:
             pass
 
@@ -67,28 +123,14 @@ class Alarm:
                     self.display_time()
                     self.time -= 1
                 else:
-                    height, width = self.stdscr.getmaxyx()
-                    msg = "TIME'S UP!"
-                    y = height // 2
-                    x = (width - len(msg)) // 2
-
-                    try:
-                        self.stdscr.addstr(y, x, msg, curses.color_pair(1))
-
-                        msg_y = y + 2
-                        msg_x = (width - len(self.message)) // 2
-                        self.stdscr.addstr(msg_y, msg_x, self.message, curses.color_pair(1))
-
-                    except curses.error:
-                        pass
-
+                    self.display_finished_screen()
                     self.stdscr.refresh()
-                    if not self.message:
-                        subprocess.run(['notify-send', 'Alarm Set', f'Time: {self.args.time}'], stderr=subprocess.DEVNULL)
-                    else:
-                        subprocess.run(['notify-send', 'Alarm Set', f'{self.message} - Time: {self.args.time}'], stderr=subprocess.DEVNULL)
-                    self.logger.log(f"Alarm Set - Time: {self.args.time}")
-                    subprocess.run(['cvlc', os.getenv("ALARM_SOUND_PATH")], stderr=subprocess.DEVNULL)
+
+                    notification_body = f'{self.message} - Time: {self.args.time}' if self.message else f'Time: {self.args.time}'
+                    self.send_notification('Alarm Finished', notification_body)
+                    self.logger.log(f"Alarm finished - Time: {self.args.time}")
+                    self.play_alarm_sound()
+                    
                     self.stdscr.timeout(-1)
                     self.stdscr.getch()
                     break
@@ -96,6 +138,7 @@ class Alarm:
                 self.stdscr.refresh()
                 key = self.stdscr.getch()
                 if key == ord('q') or key == 27:
+                    self.logger.log("Program cancelled by user")
                     break
 
         except KeyboardInterrupt:
@@ -125,14 +168,25 @@ def init_colors():
 
 
 def main(args: Namespace) -> None:
-    seconds: int = parse_time(args.time)
+    try:
+        seconds: int = parse_time(args.time)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     message: str = args.message
     logger = Logger()
 
     if not message:
-        subprocess.run(['notify-send', 'Alarm Set', f'Time: {args.time}'], stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ['notify-send', 'Alarm Set', f'Time: {args.time}'],
+            stderr=subprocess.DEVNULL
+        )
     else:
-        subprocess.run(['notify-send', 'Alarm Set', f'{message} - Time: {args.time}'], stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ['notify-send', 'Alarm Set', f'{message} - Time: {args.time}'],
+            stderr=subprocess.DEVNULL
+        )
     logger.log(f'Alarm Set - Time: {args.time}')
     curses.wrapper(lambda stdscr: Alarm(stdscr, args, logger, seconds, message).run())
 
